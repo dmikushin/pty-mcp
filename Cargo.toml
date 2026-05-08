@@ -1,0 +1,38 @@
+[package]
+name = "pty-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server exposing a freeze-able PTY tool for agents"
+license = "MIT"
+
+[[bin]]
+name = "pty-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# PTY spawn / read / write — same crate that backs wezterm.
+portable-pty = "0.8"
+
+# Headless terminal emulator. vt100 is a focused, well-tested xterm-like
+# emulator with alternate-screen + scrollback + the modes we care about.
+# Smaller surface than wezterm-term but good enough for the prototype;
+# we can swap if we hit edges.
+vt100 = "0.15"
+
+# Signals (SIGSTOP/SIGCONT/SIGTERM/SIGKILL) and pid types.
+nix = { version = "0.29", features = ["signal", "process"] }
+
+# JSON-RPC + serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Channel between the PTY reader thread and the main thread.
+crossbeam-channel = "0.5"
+
+# Errors
+anyhow = "1"
+thiserror = "1"
+
+# Tracing / logs to stderr (stdout is reserved for MCP protocol).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
