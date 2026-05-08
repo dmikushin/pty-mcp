@@ -33,6 +33,9 @@ crossbeam-channel = "0.5"
 anyhow = "1"
 thiserror = "1"
 
+# `getuid` for the default socket path; `setsid` for daemon detach.
+libc = "0.2"
+
 # Tracing / logs to stderr (stdout is reserved for MCP protocol).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

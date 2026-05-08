@@ -35,6 +35,7 @@ zero of those seconds. Next `pty_send` resumes execution. Next
 | `pty_open` | Spawn a command in a fresh PTY. Returns a handle. `freeze: true` (default) enables SIGSTOP-between-turns. |
 | `pty_send` | Send keys to the session. Auto-resumes if frozen. Supports `<Enter>`, `<C-c>`, `<Up>`, `<F5>`, etc. |
 | `pty_screenshot` | Wait for output to settle (no bytes for `settle_ms`), `SIGSTOP` the child, return rendered screen + cursor + raw bytes since last screenshot. |
+| `pty_tail` | Drain raw output WITHOUT freezing or rendering. For live-monitoring long commands (`make`, `pytest`, `cargo build`) without disturbing the process. |
 | `pty_resize` | Change cols/rows. SIGWINCH delivered to the child. |
 | `pty_close` | SIGCONT (in case it was paused), SIGTERM, SIGKILL after 1 s grace. |
 | `pty_list` | Enumerate live sessions. |
@@ -92,6 +93,35 @@ For these cases set `freeze: false` on `pty_open` — the session behaves
 as a plain streaming PTY without SIGSTOP between turns. You lose the
 "unlimited think time" but keep real-time semantics.
 
+## Architecture: client + daemon
+
+The same binary runs in two modes:
+
+* **Client (default)** — a stateless MCP server that speaks JSON-RPC
+  over stdin/stdout. Hosted by your agent (Claude Code, Dario, etc).
+  Connects to the daemon over a Unix socket; auto-spawns the daemon
+  if it isn't running.
+
+* **Daemon (`pty-mcp --daemon`)** — a long-lived process that owns
+  every PTY session. Sessions live here, not in the client. When the
+  agent host restarts (Dario reboot, IDE reload, …) the daemon
+  doesn't notice; the new client connects and inherits the live
+  session list.
+
+```
++--------+   stdin/stdout    +-----------------+   unix socket    +-----------+
+| Dario  | <───── JSON-RPC ─> | pty-mcp client  | <─── JSON-RPC ─> | pty-mcp   |
+| Claude |                    | (per-session)   |                  | daemon    |
++--------+                    +-----------------+                  | (PTYs)    |
+                                                                   +-----------+
+```
+
+Socket path resolution: `$PTY_MCP_SOCKET` if set, else
+`$XDG_RUNTIME_DIR/pty-mcp.sock`, else `/tmp/pty-mcp-<uid>.sock`.
+
+Killing the daemon kills every session it owns. The client process
+exiting does not.
+
 ## Build
 
 ```sh
@@ -102,12 +132,23 @@ cargo build --release
 ## Test
 
 ```sh
-cargo test                 # 7 unit + 4 integration tests
+cargo test                 # 7 unit + 6 integration tests
 ```
 
-Integration tests exercise the full stdio protocol against the compiled
-binary, including a freeze test that verifies a `while true; echo tick`
-loop emits zero bytes during a 700 ms sleep between two screenshots.
+Integration tests exercise the full client/daemon protocol against
+the compiled binary, including:
+
+* echo command renders correctly through the vt100 emulator
+* interactive bash session round-trips a `uname -s` query
+* `freeze: true` actually pauses the child (700 ms sleep between
+  screenshots → 0 bytes from a `tick` loop — proves real SIGSTOP, not
+  flow control)
+* `pty_close` kills runaway loops
+* `pty_tail` streams output WITHOUT freezing the child
+* **session persists across client restart** — open in client A,
+  drop the entire client process, connect a fresh client B to the
+  same socket, the session is still there with its render buffer
+  intact
 
 ## Wire it into Claude Code / Dario
 
