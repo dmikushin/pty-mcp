@@ -122,6 +122,53 @@ Socket path resolution: `$PTY_MCP_SOCKET` if set, else
 Killing the daemon kills every session it owns. The client process
 exiting does not.
 
+## Configuration
+
+The daemon reads its config from environment variables at startup:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PTY_MCP_SOCKET` | (see above) | Unix socket path. Override per-instance for tests / multi-tenant setups. |
+| `PTY_MCP_MAX_SESSIONS` | `64` | Hard cap on concurrent live sessions. Further `pty_open` calls are rejected with a clean error. Setting `0` is ignored — use the default. |
+| `PTY_MCP_LOG` | `info` | `tracing-subscriber` filter (e.g. `debug`, `pty_mcp=trace,portable_pty=warn`). Logs go to stderr; stdout is reserved for protocol. |
+
+CLI flags:
+
+| Flag | Meaning |
+|---|---|
+| `--daemon` | Run as the daemon. Otherwise runs as the MCP-server client and auto-spawns a daemon if needed. |
+| `--socket <path>` | Override the socket path (same effect as `PTY_MCP_SOCKET`). Useful in tests so isolated test instances don't collide. |
+| `--version` / `-V` | Print version. |
+| `--help` / `-h` | Print usage. |
+
+## Wire it into Claude Code / Dario
+
+Add to `~/.claude.json` (Claude Code) or `~/.dario/config.json` (Dario)
+under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "pty": {
+      "command": "/path/to/pty-mcp"
+    }
+  }
+}
+```
+
+Each agent host launches its own client process; the first one to
+talk to the binary auto-spawns the daemon. Subsequent hosts (or
+restarts of the same host) share the daemon and inherit live
+sessions. Tools become available as `mcp__pty__pty_open`,
+`mcp__pty__pty_send`, etc.
+
+To force a fresh daemon (after manual edits, version bumps, etc.):
+
+```sh
+pkill -f 'pty-mcp --daemon'        # daemon dies, sessions die
+rm -f "$XDG_RUNTIME_DIR/pty-mcp.sock"
+```
+
 ## Build
 
 ```sh
@@ -132,7 +179,7 @@ cargo build --release
 ## Test
 
 ```sh
-cargo test                 # 7 unit + 6 integration tests
+cargo test                 # 7 unit + 7 integration tests
 ```
 
 Integration tests exercise the full client/daemon protocol against
@@ -149,24 +196,13 @@ the compiled binary, including:
   drop the entire client process, connect a fresh client B to the
   same socket, the session is still there with its render buffer
   intact
+* **session cap rejects overflow** — daemon started with
+  `PTY_MCP_MAX_SESSIONS=3` accepts 3 opens, rejects the 4th with a
+  clean error, accepts again after one is closed
 
 ## Wire it into Claude Code / Dario
 
-Add to `~/.claude.json` or equivalent:
-
-```json
-{
-  "mcpServers": {
-    "pty": {
-      "command": "/path/to/pty-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-Tools become available as `mcp__pty__pty_open`, `mcp__pty__pty_send`,
-etc.
+(See "Configuration" above for the full `mcpServers` block.)
 
 ## License
 

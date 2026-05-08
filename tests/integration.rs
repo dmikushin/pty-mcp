@@ -43,19 +43,24 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+
+    /// Start the daemon with extra env vars (e.g. PTY_MCP_MAX_SESSIONS=3).
+    fn start_with_env(extra_env: &[(&str, &str)]) -> Self {
         let socket = unique_socket_path();
-        // No-op if the file is fresh, but harmless if a previous run
-        // crashed and left the path behind.
         let _ = std::fs::remove_file(&socket);
-        let process = Command::new(BIN)
-            .arg("--daemon")
+        let mut cmd = Command::new(BIN);
+        cmd.arg("--daemon")
             .arg("--socket")
             .arg(&socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
+            .stderr(Stdio::null());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let process = cmd.spawn().expect("spawn daemon");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !socket.exists() {
             if Instant::now() > deadline {
@@ -133,6 +138,20 @@ impl TestClient {
         }
         serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("tool {name} returned non-JSON content: {e}\n{text}"))
+    }
+
+    /// Like `call_tool` but tolerant of `isError: true` — returns the
+    /// raw error message as a String when the tool fails. Useful for
+    /// asserting on expected failure modes.
+    fn try_call_tool(&mut self, name: &str, args: Value) -> Result<Value, String> {
+        let result = self.request("tools/call", json!({"name": name, "arguments": args}));
+        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        if is_error {
+            return Err(text);
+        }
+        Ok(serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("tool {name} returned non-JSON content: {e}\n{text}")))
     }
 }
 
@@ -337,4 +356,37 @@ fn session_persists_across_client_restart() {
     );
 
     b.call_tool("pty_close", json!({ "handle": &handle }));
+}
+
+// --- Resource limits --------------------------------------------------------
+
+#[test]
+fn session_cap_rejects_overflow() {
+    // Cap at 3 sessions for this test. Open 3, expect each to
+    // succeed; open the 4th, expect a clean error (not a crash, not
+    // a hang). Then close one and confirm the cap re-opens.
+    let daemon = TestDaemon::start_with_env(&[("PTY_MCP_MAX_SESSIONS", "3")]);
+    let mut c = TestClient::connect(&daemon.socket);
+
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let opened = c.call_tool("pty_open", json!({ "command": "sleep 30" }));
+        handles.push(opened["handle"].as_str().unwrap().to_string());
+    }
+
+    let res = c.try_call_tool("pty_open", json!({ "command": "sleep 30" }));
+    let err = res.expect_err("4th open should fail under cap=3");
+    assert!(
+        err.contains("session cap reached"),
+        "expected cap error, got: {err:?}"
+    );
+
+    // Free a slot — the next open should succeed.
+    c.call_tool("pty_close", json!({ "handle": &handles[0] }));
+    let opened = c.call_tool("pty_open", json!({ "command": "sleep 30" }));
+    handles[0] = opened["handle"].as_str().unwrap().to_string();
+
+    for h in &handles {
+        c.call_tool("pty_close", json!({ "handle": h }));
+    }
 }

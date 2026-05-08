@@ -15,6 +15,30 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "pty-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Hard cap on concurrently open sessions. Each PTY costs an FD pair
+/// for master/slave plus two threads (reader + waitpid) and ~MB of
+/// scrollback in the vt100 emulator — leaving the limit unbounded
+/// would let a runaway agent exhaust the daemon's FD table or
+/// memory before we noticed. 64 covers normal use (a handful of
+/// background builds + an interactive shell) with three orders of
+/// magnitude of headroom.
+///
+/// Override with `PTY_MCP_MAX_SESSIONS=<N>`. Setting `0` is rejected
+/// (use the default instead) so a typo can't silently disable
+/// session creation altogether.
+const DEFAULT_MAX_SESSIONS: usize = 64;
+
+fn max_sessions() -> usize {
+    if let Ok(s) = std::env::var("PTY_MCP_MAX_SESSIONS") {
+        if let Ok(n) = s.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    DEFAULT_MAX_SESSIONS
+}
+
 // --- JSON-RPC envelope -------------------------------------------------------
 
 #[derive(Deserialize, Debug)]
@@ -131,11 +155,31 @@ impl Server {
             })
             .unwrap_or_default();
 
+        // Enforce the cap BEFORE spawning so a botched agent can't
+        // exhaust FDs / memory before the lock check completes.
+        let cap = max_sessions();
+        {
+            let sessions = self.sessions.lock().unwrap();
+            if sessions.len() >= cap {
+                return Err(format!(
+                    "session cap reached ({cap}). Close an existing session or raise PTY_MCP_MAX_SESSIONS."
+                ));
+            }
+        }
+
         let handle = self.next_handle();
         let session = PtySession::spawn(handle.clone(), &command, cols, rows, env, cwd, freeze)
             .map_err(|e| format!("spawn failed: {e:#}"))?;
         let info = session.info();
-        self.sessions.lock().unwrap().insert(handle.clone(), session);
+        // Re-check under the lock before insertion in case another
+        // concurrent request raced us past the first check.
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.len() >= cap {
+            // Drop the session we just spawned — close() runs in Drop.
+            drop(session);
+            return Err(format!("session cap reached ({cap})"));
+        }
+        sessions.insert(handle.clone(), session);
         Ok(json!(info))
     }
 
