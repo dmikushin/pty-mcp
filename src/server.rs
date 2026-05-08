@@ -265,6 +265,20 @@ impl Server {
         session.resume().map_err(|e| format!("resume failed: {e:#}"))?;
         Ok(json!({ "ok": true }))
     }
+
+    /// Close every session this server owns, draining the map.
+    /// Used by the daemon during graceful shutdown so PTYs aren't
+    /// orphaned when the daemon process exits.
+    pub fn close_all(&self) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let count = sessions.len();
+        if count > 0 {
+            tracing::info!("closing {count} live session(s)");
+        }
+        for (_handle, mut session) in sessions.drain() {
+            let _ = session.close();
+        }
+    }
 }
 
 fn require_handle(args: &Value) -> Result<String, String> {

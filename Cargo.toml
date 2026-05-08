@@ -36,6 +36,10 @@ thiserror = "1"
 # `getuid` for the default socket path; `setsid` for daemon detach.
 libc = "0.2"
 
+# Signal handling for graceful daemon shutdown (SIGTERM/SIGINT/SIGHUP).
+# `iterator` feature gives us the convenient `Signals::forever()` API.
+signal-hook = { version = "0.3", features = [] }
+
 # Tracing / logs to stderr (stdout is reserved for MCP protocol).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

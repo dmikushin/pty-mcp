@@ -29,11 +29,14 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use server::{Server, handle_message};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use tracing::{info, warn};
 
 fn main() -> Result<()> {
@@ -126,7 +129,33 @@ fn run_daemon(socket_path: &Path) -> Result<()> {
     info!("daemon listening on {}", socket_path.display());
 
     let server = Arc::new(Server::new());
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Install SIGTERM/SIGINT/SIGHUP handler. On the first signal we
+    // flip the flag and self-connect to the listener — that wakes up
+    // the blocked `accept()` so the main loop can re-check the flag
+    // and exit cleanly.
+    {
+        let shutdown = shutdown.clone();
+        let socket_path = socket_path.to_path_buf();
+        let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])
+            .context("installing signal handler")?;
+        thread::spawn(move || {
+            for sig in signals.forever() {
+                info!("received signal {sig}, initiating shutdown");
+                shutdown.store(true, Ordering::SeqCst);
+                // Wake the blocked accept(). We don't need the
+                // connection — peer will see EOF immediately.
+                let _ = UnixStream::connect(&socket_path);
+                break;
+            }
+        });
+    }
+
     for conn in listener.incoming() {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         let conn = match conn {
             Ok(c) => c,
             Err(e) => {
@@ -141,6 +170,10 @@ fn run_daemon(socket_path: &Path) -> Result<()> {
             }
         });
     }
+
+    info!("draining sessions and removing socket");
+    server.close_all();
+    let _ = std::fs::remove_file(socket_path);
     Ok(())
 }
 

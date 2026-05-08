@@ -390,3 +390,134 @@ fn session_cap_rejects_overflow() {
         c.call_tool("pty_close", json!({ "handle": h }));
     }
 }
+
+// --- Graceful shutdown ------------------------------------------------------
+
+#[test]
+fn daemon_shuts_down_cleanly_on_sigterm() {
+    // Spawn daemon, open a couple of sessions, send SIGTERM, then
+    // verify:
+    //   * the daemon process exits within a small grace period
+    //     (i.e. graceful — it didn't need SIGKILL),
+    //   * the socket file is unlinked (next client gets to start a
+    //     fresh daemon, not stumble over a stale path),
+    //   * no PTY-child processes remain in the daemon's process
+    //     subtree (the close_all path actually closed them).
+
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut daemon = TestDaemon::start();
+    let socket = daemon.socket.clone();
+    let daemon_pid = daemon.process.as_ref().unwrap().id() as i32;
+
+    // Open two long-running sessions, then drop the client (which
+    // does NOT kill them — we want the daemon to do that).
+    {
+        let mut c = TestClient::connect(&socket);
+        c.call_tool("pty_open", json!({ "command": "sleep 60" }));
+        c.call_tool("pty_open", json!({ "command": "sleep 60" }));
+    }
+    let before = ppid_descendants(daemon_pid);
+    assert!(
+        before.len() >= 2,
+        "expected ≥2 PTY descendants before shutdown, got {before:?}"
+    );
+
+    // SIGTERM the daemon.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(daemon_pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("kill -SIGTERM daemon");
+
+    // Wait up to 3 s for the daemon to exit through its own
+    // shutdown path. If it didn't, force-kill so the test harness
+    // doesn't hang, then fail.
+    let mut process = daemon.process.take().expect("process still owned");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if Instant::now() > deadline {
+            let _ = process.kill();
+            let _ = process.wait();
+            panic!("daemon did not exit within 3s of SIGTERM (graceful shutdown failed)");
+        }
+        match process.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+            Err(e) => panic!("wait failed: {e}"),
+        }
+    };
+    assert!(
+        status.code() == Some(0)
+            || status.signal() == Some(nix::sys::signal::Signal::SIGTERM as i32),
+        "daemon exited unexpectedly: {status:?}"
+    );
+
+    // Socket file must be cleaned up.
+    assert!(!socket.exists(), "socket file leaked: {}", socket.display());
+
+    // PTY children must be reaped. They were children of the daemon;
+    // after the daemon dies they're either gone (we sent SIGTERM in
+    // close_all) or reparented to PID 1 and dying. Allow up to 2 s.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let alive: Vec<i32> = before
+            .iter()
+            .copied()
+            .filter(|pid| nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid), None).is_ok())
+            .collect();
+        if alive.is_empty() {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("PTY children still alive after daemon shutdown: {alive:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Find every process whose ppid (or further ancestor) is `parent`.
+/// We need to walk the tree because portable-pty may spawn through a
+/// shell helper, so direct children alone aren't sufficient.
+fn ppid_descendants(parent: i32) -> Vec<i32> {
+    use std::collections::HashSet;
+    let mut by_ppid: std::collections::HashMap<i32, Vec<i32>> = Default::default();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let pid: i32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("PPid:") {
+                if let Ok(ppid) = rest.trim().parse::<i32>() {
+                    by_ppid.entry(ppid).or_default().push(pid);
+                }
+                break;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut frontier = vec![parent];
+    let mut seen: HashSet<i32> = HashSet::new();
+    while let Some(p) = frontier.pop() {
+        if let Some(children) = by_ppid.get(&p) {
+            for &c in children {
+                if seen.insert(c) {
+                    out.push(c);
+                    frontier.push(c);
+                }
+            }
+        }
+    }
+    out
+}

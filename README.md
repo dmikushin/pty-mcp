@@ -122,6 +122,19 @@ Socket path resolution: `$PTY_MCP_SOCKET` if set, else
 Killing the daemon kills every session it owns. The client process
 exiting does not.
 
+## Graceful shutdown
+
+The daemon installs a handler for `SIGTERM`, `SIGINT`, and `SIGHUP`.
+On any of them it stops accepting new connections, runs
+`pty_close`-equivalent cleanup on every live session
+(SIGCONT → SIGTERM → SIGKILL with a 1 s grace, per session), unlinks
+the socket file, and exits with status 0. No PTY children are leaked
+across daemon restarts.
+
+`SIGKILL` to the daemon obviously skips this — sessions die unclean
+and the socket file lingers until the next start (which auto-cleans
+stale sockets).
+
 ## Configuration
 
 The daemon reads its config from environment variables at startup:
@@ -179,7 +192,7 @@ cargo build --release
 ## Test
 
 ```sh
-cargo test                 # 7 unit + 7 integration tests
+cargo test                 # 7 unit + 8 integration tests
 ```
 
 Integration tests exercise the full client/daemon protocol against
@@ -199,6 +212,10 @@ the compiled binary, including:
 * **session cap rejects overflow** — daemon started with
   `PTY_MCP_MAX_SESSIONS=3` accepts 3 opens, rejects the 4th with a
   clean error, accepts again after one is closed
+* **daemon shuts down cleanly on SIGTERM** — the daemon process
+  exits within 3 s of the signal (no SIGKILL needed), the socket
+  file is unlinked, and every PTY child the daemon spawned is gone
+  from the process tree
 
 ## Wire it into Claude Code / Dario
 
