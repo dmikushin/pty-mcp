@@ -65,6 +65,16 @@ pub struct ScreenshotResult {
     pub raw_since_last: String,
 }
 
+#[derive(Serialize)]
+pub struct TailResult {
+    pub handle: String,
+    pub state: PtyState,
+    pub exit_code: Option<i32>,
+    /// Raw bytes captured by the reader thread since the previous
+    /// `tail` or `screenshot` call (whichever was most recent).
+    pub raw_since_last: String,
+}
+
 #[derive(Serialize, Clone)]
 pub struct SessionInfo {
     pub handle: String,
@@ -328,6 +338,26 @@ impl PtySession {
             self.state = PtyState::Running;
         }
         Ok(())
+    }
+
+    /// Drain the raw byte buffer **without** freezing the child or
+    /// rendering the screen. Useful for live tail-style monitoring of a
+    /// long-running command (e.g. `make`, `pytest`, `cargo build`)
+    /// where the agent wants to see incremental output without
+    /// disrupting the process. State (running/paused/exited) and
+    /// process timing are unchanged.
+    pub fn tail(&self) -> TailResult {
+        let raw = {
+            let mut buf = self.raw_buffer.lock().unwrap();
+            let drained = std::mem::take(&mut *buf);
+            String::from_utf8_lossy(&drained).into_owned()
+        };
+        TailResult {
+            handle: self.handle.clone(),
+            state: self.current_state(),
+            exit_code: *self.exit_status.lock().unwrap(),
+            raw_since_last: raw,
+        }
     }
 
     /// Close the session. Best-effort SIGCONT (in case it was paused),

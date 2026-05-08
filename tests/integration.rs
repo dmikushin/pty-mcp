@@ -210,3 +210,37 @@ fn close_kills_runaway_loop() {
     let sessions = listed["sessions"].as_array().unwrap();
     assert!(sessions.is_empty(), "session should be removed after close");
 }
+
+#[test]
+fn tail_streams_without_freezing() {
+    // `pty_tail` must drain accumulated output without SIGSTOP-ing the
+    // child. Verify by tailing twice with a sleep in between against
+    // a `tick` loop and observing that *both* tails return non-empty
+    // output (process kept running between them).
+
+    let mut s = Server::start();
+    let opened = s.call_tool("pty_open", json!({
+        "command": "while true; do echo tick; sleep 0.05; done",
+        "freeze": true
+    }));
+    let handle = opened["handle"].as_str().unwrap().to_string();
+
+    // Give the child time to produce a few ticks before the first tail.
+    std::thread::sleep(Duration::from_millis(250));
+
+    // Initial tail: state should still be running, ticks accumulated.
+    let t1 = s.call_tool("pty_tail", json!({ "handle": &handle }));
+    assert_eq!(t1["state"], "running", "tail must NOT freeze the child");
+    let raw1 = t1["raw_since_last"].as_str().unwrap();
+    assert!(raw1.contains("tick"), "expected ticks in first tail: {raw1:?}");
+
+    // Wait, then tail again. Process should still be running and
+    // produced more output.
+    std::thread::sleep(Duration::from_millis(300));
+    let t2 = s.call_tool("pty_tail", json!({ "handle": &handle }));
+    assert_eq!(t2["state"], "running", "still running between tails");
+    let raw2 = t2["raw_since_last"].as_str().unwrap();
+    assert!(raw2.contains("tick"), "expected new ticks in second tail: {raw2:?}");
+
+    s.call_tool("pty_close", json!({ "handle": &handle }));
+}

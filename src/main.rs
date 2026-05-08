@@ -34,7 +34,7 @@ use std::sync::Mutex;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use session::{PtySession, ScreenshotResult, SessionInfo};
+use session::{PtySession, ScreenshotResult, SessionInfo, TailResult};
 use tracing::{error, info, warn};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -126,6 +126,7 @@ impl Server {
             "pty_open" => self.tool_open(&args),
             "pty_send" => self.tool_send(&args),
             "pty_screenshot" => self.tool_screenshot(&args),
+            "pty_tail" => self.tool_tail(&args),
             "pty_resize" => self.tool_resize(&args),
             "pty_close" => self.tool_close(&args),
             "pty_list" => self.tool_list(),
@@ -192,6 +193,16 @@ impl Server {
             .screenshot(settle_ms, max_wait_ms)
             .map_err(|e| format!("screenshot failed: {e:#}"))?;
         Ok(json!(snap))
+    }
+
+    fn tool_tail(&self, args: &Value) -> Result<Value, String> {
+        let handle = require_handle(args)?;
+        let sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .get(&handle)
+            .ok_or_else(|| format!("unknown handle: {handle}"))?;
+        let tail: TailResult = session.tail();
+        Ok(json!(tail))
     }
 
     fn tool_resize(&self, args: &Value) -> Result<Value, String> {
@@ -309,6 +320,17 @@ fn tool_specs() -> Vec<Value> {
                         "description": "Quiet period required before the screenshot is taken." },
                     "max_wait_ms": { "type": "integer", "default": 2000,
                         "description": "Hard cap on total settle wait. After this elapses, the screenshot is taken regardless of activity (useful for `top`-style continuously-redrawing programs)." }
+                },
+                "required": ["handle"]
+            }
+        }),
+        json!({
+            "name": "pty_tail",
+            "description": "Drain the raw output buffer WITHOUT freezing or rendering. Returns whatever bytes the reader has accumulated since the last `tail` or `screenshot` call.\n\nUse this for live-monitoring long commands (`make`, `pytest`, `cargo build`) where the agent wants incremental output without disturbing the process. State (running/paused/exited) is unchanged — call `pty_screenshot` afterwards if you need the rendered screen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "handle": { "type": "string" }
                 },
                 "required": ["handle"]
             }
