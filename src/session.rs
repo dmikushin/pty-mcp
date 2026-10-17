@@ -98,6 +98,10 @@ pub struct PtySession {
     /// Last time the reader thread observed any byte. Used by the
     /// settle loop in `screenshot`.
     last_byte_at: Arc<Mutex<Instant>>,
+    /// Last time we wrote input to the child or resumed it. The settle
+    /// loop measures quiet from whichever of this and `last_byte_at` is
+    /// later: output produced *before* the input is not an answer to it.
+    last_poke_at: Instant,
     /// Raw bytes captured since the last screenshot. Drained on
     /// screenshot.
     raw_buffer: Arc<Mutex<Vec<u8>>>,
@@ -217,6 +221,7 @@ impl PtySession {
             writer,
             parser,
             last_byte_at,
+            last_poke_at: Instant::now(),
             raw_buffer,
             eof,
             exit_status,
@@ -255,6 +260,7 @@ impl PtySession {
         }
         self.writer.write_all(bytes).context("PTY master write failed")?;
         self.writer.flush().ok();
+        self.last_poke_at = Instant::now();
         Ok(())
     }
 
@@ -315,7 +321,7 @@ impl PtySession {
         let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
         let quiet_threshold = Duration::from_millis(settle_ms);
         loop {
-            let last = *self.last_byte_at.lock().unwrap();
+            let last = (*self.last_byte_at.lock().unwrap()).max(self.last_poke_at);
             if last.elapsed() >= quiet_threshold {
                 return;
             }
@@ -336,6 +342,7 @@ impl PtySession {
         if self.state == PtyState::Paused {
             kill(self.pid, Signal::SIGCONT).ok();
             self.state = PtyState::Running;
+            self.last_poke_at = Instant::now();
         }
         Ok(())
     }

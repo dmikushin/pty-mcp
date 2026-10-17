@@ -231,6 +231,60 @@ fn interactive_bash_session_round_trips() {
     c.call_tool("pty_close", json!({ "handle": &handle }));
 }
 
+// The settle window must start at the input, not at the last output byte:
+// if the previous output is already older than `settle_ms`, a screenshot
+// right after `pty_send` used to return at once and freeze the child
+// before it answered (interactive_bash_session_round_trips failed about
+// half the time that way). Here the answer comes 100 ms after the input
+// and the old output is 500 ms old, so the race is not left to chance.
+// freeze: false, so the window has to come from the send itself rather
+// than from the resume a frozen session gets first.
+#[test]
+fn screenshot_after_send_waits_for_the_answer() {
+    let daemon = TestDaemon::start();
+    let mut c = TestClient::connect(&daemon.socket);
+    let opened = c.call_tool("pty_open", json!({
+        "command": "bash --noprofile --norc",
+        "cols": 80,
+        "rows": 24,
+        "freeze": false
+    }));
+    let handle = opened["handle"].as_str().unwrap().to_string();
+    c.call_tool("pty_screenshot", json!({ "handle": &handle, "settle_ms": 200, "max_wait_ms": 1500 }));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    c.call_tool("pty_send", json!({ "handle": &handle, "keys": "sleep 0.1; echo AN''SWER<Enter>" }));
+    let snap = c.call_tool("pty_screenshot", json!({ "handle": &handle, "settle_ms": 300, "max_wait_ms": 2000 }));
+    let screen = snap["screen"].as_str().unwrap();
+    assert!(screen.contains("ANSWER"), "answer not visible: {screen:?}");
+
+    c.call_tool("pty_close", json!({ "handle": &handle }));
+}
+
+// Same for an explicit pty_resume: output the child produces after SIGCONT
+// is the screenshot's subject, however old the output before the freeze.
+#[test]
+fn screenshot_after_resume_waits_for_the_answer() {
+    let daemon = TestDaemon::start();
+    let mut c = TestClient::connect(&daemon.socket);
+    let opened = c.call_tool("pty_open", json!({
+        "command": "sleep 0.6; sleep 0.1; echo LATE; sleep 5",
+        "cols": 80,
+        "rows": 24
+    }));
+    let handle = opened["handle"].as_str().unwrap().to_string();
+    let first = c.call_tool("pty_screenshot", json!({ "handle": &handle, "settle_ms": 200, "max_wait_ms": 1500 }));
+    assert_eq!(first["state"], "paused");
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    c.call_tool("pty_resume", json!({ "handle": &handle }));
+    let snap = c.call_tool("pty_screenshot", json!({ "handle": &handle, "settle_ms": 300, "max_wait_ms": 2000 }));
+    let screen = snap["screen"].as_str().unwrap();
+    assert!(screen.contains("LATE"), "output after resume not visible: {screen:?}");
+
+    c.call_tool("pty_close", json!({ "handle": &handle }));
+}
+
 #[test]
 fn freeze_actually_pauses_the_child() {
     let daemon = TestDaemon::start();
