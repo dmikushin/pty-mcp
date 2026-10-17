@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # PTY spawn / read / write — same crate that backs wezterm.
-portable-pty = "0.8"
+portable-pty = "0.9"
 
 # Headless terminal emulator. vt100 is a focused, well-tested xterm-like
 # emulator with alternate-screen + scrollback + the modes we care about.
